@@ -3,7 +3,7 @@ kind: CronJob
 metadata:
   name: shortstockmonitor
 spec:
-  schedule: "35 0 * * *"  # run daily at 12:00 UTC
+  schedule: "39 0 * * *"  # run daily at 12:00 UTC
   jobTemplate:
     spec:
       template:
