@@ -136,10 +136,35 @@ def load_previous_state() -> Dict:
         return json.load(f)
 
 
-def save_state(df):
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(STATE_PATH, index=False)
+def save_state(current):
+    """
+    Save the latest borrow/availability snapshot to disk.
 
+    Accepts either:
+      - a pandas DataFrame, or
+      - a dict of the form { "TICKER": { ...metrics... }, ... }
+    """
+    # Convert dict → DataFrame if needed
+    if isinstance(current, dict):
+        # Expect something like: {"ABNY": {"borrow": 0.446, "available": 6000}, ...}
+        rows = []
+        for symbol, metrics in current.items():
+            row = {"symbol": symbol}
+            if isinstance(metrics, dict):
+                row.update(metrics)
+            else:
+                # If metrics is just a single value, store it under "value"
+                row["value"] = metrics
+            rows.append(row)
+        df = pd.DataFrame(rows)
+    else:
+        # Assume it's already a DataFrame-like object
+        df = current
+
+    # Make sure directory exists
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Saving state to: {STATE_PATH}")
+    df.to_csv(STATE_PATH, index=False)
 
 
 # ------------- ALERT LOGIC ----------------
