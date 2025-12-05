@@ -17,7 +17,12 @@ FTP_PASS = ""
 FTP_FILE = os.getenv("IBKR_FTP_FILE", "usa.txt")
 
 
-STATE_PATH = Path(os.environ.get("STATE_PATH", "state/shortstock_state.csv"))
+# Base workspace (GitHub Actions sets this, but fallback to ".")
+WORKSPACE = Path(os.getenv("GITHUB_WORKSPACE", ".")).resolve()
+
+# Allow override via env var, default to "state/shortstock_state.csv"
+STATE_PATH = WORKSPACE / os.getenv("STATE_PATH", "state/shortstock_state.csv")
+
 TICKER_FILE = os.getenv("TICKER_FILE", "/config/tickers.csv")
 
 def load_ticker_list(path: str) -> List[str]:
