@@ -1,0 +1,45 @@
+name: Short Stock Monitor
+
+on:
+  schedule:
+    # Runs every day at 12:00 UTC (adjust if you like)
+    - cron: "0 12 * * *"
+  workflow_dispatch: {}  # lets you run it manually from the Actions tab
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+
+      - name: Run shortstock monitor
+        env:
+          # Path to your tickers file inside the repo
+          TICKER_FILE: "config/tickers.csv"
+
+          # Thresholds (tune as needed)
+          BORROW_ABS_THRESHOLD: "0.30"
+          BORROW_CHANGE_THRESHOLD: "0.05"
+          AVAIL_ABS_THRESHOLD: "10000"
+          AVAIL_CHANGE_THRESHOLD: "50000"
+
+          # Email + SMTP – pulled from GitHub Secrets
+          SMTP_HOST: "smtp.gmail.com"
+          SMTP_PORT: "587"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          python shortstockmonitor.py
