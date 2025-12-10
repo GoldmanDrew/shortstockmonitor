@@ -1,144 +1,100 @@
-LS-ALGO
+# LS-ALGO
 
-LS-ALGO is an end-to-end Python pipeline for managing a rules-driven long/short trading strategy using a defined universe of tickers.
-The system screens tickers, generates trading signals, maintains long/short positions, and monitors IBKR short-stock availability.
-It is designed to run automatically once per day via GitHub Actions or locally via a helper script.
+LS-ALGO is a Python pipeline for running a rules-driven long/short ETF strategy end to end. The system screens a configured universe, builds target pairs, optionally trades them through Interactive Brokers (IBKR), and monitors short borrow conditions for alerts.
 
-At a high level, the pipeline performs three core tasks:
+## Components
 
-1. ETF & Ticker Screening (etf_screener.py)
+### 1) ETF Screener — `etf_screener.py`
+- Loads ETF metadata and historical CAGR values from `config/etf_cagr.csv`.
+- Downloads the IBKR short-stock file from FTP (`IBKR_FTP_HOST`, `IBKR_FTP_USER`, `IBKR_FTP_PASS`, `IBKR_FTP_FILE`).
+- Computes net borrow (`fee - rebate`), available shares, and screening flags.
+- Applies rules driven by `BORROW_CAP` and `MIN_SHARES_AVAILABLE` to set `include_for_algo`.
+- Writes the full table to `data/etf_screened_today.csv` for downstream steps.
 
-Screens a universe of tickers (from config/tickers.csv)
+### 2) Trading Logic — `ibkr_algo.py`
+- Reads the screened universe (`SCREENED_CSV`, defaults to `data/etf_screened_today.csv`).
+- Merges with `config/etf_cagr.csv` to map underlying/ETF pairs and leverage type.
+- Connects to IBKR via `ib_insync` (`IB_HOST`, `IB_PORT`, `IB_CLIENT_ID`).
+- If no positions exist, splits equity across covered-call (CC) and 2x leveraged pairs, sizes orders, and submits Adaptive Passive limit orders. Set `DRY_RUN=1` to log without placing orders.
+- Saves intended positions to `data/positions_state.csv` and snapshots IB positions to `data/ib_positions_*.csv`.
 
-Calculates metrics (e.g., CAGRs, volatility, liquidity, weights) using historical datasets
+### 3) Short-Stock Monitor — `short_stock_monitor.py`
+- Loads the current ETF watchlist from the screened CSV (respects `include_for_algo` when present).
+- Fetches the IBKR short-stock file, saves a dated snapshot under `data/shortstock_snapshots/`, and builds borrow/availability maps.
+- Compares against the most recent prior snapshot to surface borrow spikes or supply drops based on `BORROW_ABS_THRESHOLD`, `BORROW_CHANGE_THRESHOLD`, `AVAIL_ABS_THRESHOLD`, and `AVAIL_CHANGE_THRESHOLD`.
+- Prints alerts and optionally emails them (`EMAIL_FROM`, `EMAIL_TO`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`).
 
-Saves the daily screened output to data/etf_screened_today.csv
+### Pipeline Wrapper — `scripts/run_daily_pipeline.sh`
+Runs the three components in sequence using the same defaults as CI. Exports standard paths, installs dependencies, and then executes `etf_screener.py`, `ibkr_algo.py`, and `short_stock_monitor.py`.
 
-Produces upstream inputs for the trading algorithm
+## Repository Layout
 
-2. IBKR Trading Logic (ibkr_algo.py)
+- `config/`
+  - `etf_cagr.csv` — ETF universe with CAGRs, underlying mapping, and leverage type.
+  - `tickers.csv` — Additional ticker list used by older monitoring workflows.
+- `data/` — Outputs and state (screened CSVs, IB position snapshots, short-stock snapshots).
+- `scripts/run_daily_pipeline.sh` — Local wrapper mirroring the GitHub Actions sequence.
+- `etf_screener.py` — Screener and borrow ingestion.
+- `ibkr_algo.py` — IBKR portfolio construction and state sync.
+- `short_stock_monitor.py` — Borrow/availability monitoring and alerting.
+- `.github/workflows/` — CI schedules for the daily pipeline and standalone monitor runs.
+- `requirements.txt` — Python dependencies for the core scripts.
 
-Reads the screened output
+## Setup
 
-Applies the long/short allocation rules
+1. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Ensure access to the IBKR FTP short-stock feed and, if trading live, an IBKR TWS/Gateway session with API enabled.
 
-Computes target positions and compares against prior state (data/positions_state.csv)
+## Running Locally
 
-Determines required trades (buys, sells, covers, shorts)
-
-Can be run in live mode or DRY_RUN mode
-
-Intended to maintain the L/S book automatically through the IB API
-
-3. Short-Stock Monitoring & Alerts (short_stock_monitor.py)
-
-Downloads the public IBKR short-stock file (usa.txt)
-
-Extracts borrow rates, rebates, and shares-available for relevant tickers
-
-Compares to prior-day snapshots
-
-Sends a daily email summarizing:
-
-Borrow rate increases
-
-Limited short supply
-
-Threshold breaches (e.g., borrow caps, minimum shares available)
-
-This gives you visibility into borrow constraints that may affect the execution or maintenance of short positions.
-
-Repository Layout
-.github/workflows/
-    daily_pipeline.yml         # GitHub Actions workflow orchestrating the full daily run
-
-config/
-    etf_cagr.csv               # Supporting dataset (historical CAGRs or related metrics)
-    tickers.csv                # Universe of tickers to screen and trade
-
-data/
-    etf_screened_today.csv     # Daily screener output
-    positions_state.csv        # Last-known target positions for diffing
-
-notebooks/
-    leveredetfresearch.ipynb   # Research + exploratory analysis
-
-scripts/
-    run_daily_pipeline.sh      # Mirrors CI pipeline locally in identical order
-
-etf_screener.py               # Step 1: screens ETF/ticker universe
-ibkr_algo.py                  # Step 2: trading / long-short maintenance logic
-short_stock_monitor.py        # Step 3: short borrow availability monitoring + alerts
-
-requirements.txt              # Python dependencies
-README.md                     # This file
-
-Running Locally
-
-Install dependencies:
-
-pip install -r requirements.txt
-
-
-Run any component individually:
-
+### Individual scripts
+```bash
 python etf_screener.py
 python ibkr_algo.py
 python short_stock_monitor.py
+```
 
-Running the Entire Daily Pipeline Locally
-
-The GitHub Actions workflow runs the pipeline in this exact order:
-
-etf_screener.py
-
-ibkr_algo.py
-
-short_stock_monitor.py
-
-To replicate the same behavior locally:
-
-1. Export the required environment variables
-
-IBKR FTP for short-stock file:
-IBKR_FTP_HOST, IBKR_FTP_USER, IBKR_FTP_PASS, IBKR_FTP_FILE
-
-Trade & monitoring params:
-BORROW_CAP, MIN_SHARES_AVAILABLE, DRY_RUN
-
-IB API connectivity:
-IB_HOST, IB_PORT, IB_CLIENT_ID
-
-Input/output paths:
-SCREENED_CSV, SNAPSHOT_DIR
-
-Email settings:
-EMAIL_FROM, EMAIL_TO, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
-
-2. Run the pipeline wrapper:
+### Full daily sequence
+Export any needed environment variables (see below), then run:
+```bash
 ./scripts/run_daily_pipeline.sh
+```
 
+## Key Environment Variables
 
-This script:
+### Screener
+- `CAGR_CSV` — Path to `etf_cagr.csv` (default `config/etf_cagr.csv`).
+- `OUTPUT_DIR`, `OUTPUT_FILE` — Where to write the screened CSV (default `data/etf_screened_today.csv`).
+- `IBKR_FTP_HOST`, `IBKR_FTP_USER`, `IBKR_FTP_PASS`, `IBKR_FTP_FILE` — FTP connection and filename (`usa.txt` by default).
+- `BORROW_CAP` — Maximum acceptable borrow before exclusion (default `0.10`).
+- `MIN_SHARES_AVAILABLE` — Minimum available shares required (default `1000`).
 
-Installs dependencies
+### Trading
+- `SCREENED_CSV` — Input from the screener (`data/etf_screened_today.csv`).
+- `IB_HOST`, `IB_PORT`, `IB_CLIENT_ID` — IBKR API connection details.
+- `DRY_RUN` — Set to `1` to log actions without placing orders.
+- `MAX_SHARES_PER_ORDER` — Clamp per-leg order size (default `500`).
 
-Applies default environment variable values
+### Monitoring & Alerts
+- `SCREENED_CSV` — Watchlist source (defaults to screener output).
+- `SNAPSHOT_DIR` — Directory for dated short-stock CSV snapshots (default `data/shortstock_snapshots`).
+- `IBKR_FTP_FILE` — FTP filename to monitor (`usa.txt` default).
+- `BORROW_ABS_THRESHOLD`, `BORROW_CHANGE_THRESHOLD` — Borrow-level alert thresholds.
+- `AVAIL_ABS_THRESHOLD`, `AVAIL_CHANGE_THRESHOLD` — Availability alert thresholds.
+- `EMAIL_FROM`, `EMAIL_TO`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` — Email settings.
 
-Executes the three core scripts in the same sequence as CI
+## Automation
 
-Allows you to validate the end-to-end behavior of the full system
+- **Daily ETF Pipeline** (`.github/workflows/daily_pipeline.yml`): runs screener → trading logic → short-stock monitor with secrets for FTP, IBKR, and email.
+- **Short Stock Monitor** (`.github/workflows/monitor.yml`): legacy workflow to run the monitor independently on a cron schedule.
 
-Summary
+## Outputs
 
-LS-ALGO is evolving into a unified automation system that:
+- `data/etf_screened_today.csv` — Screened ETF universe with borrow metrics and inclusion flags.
+- `data/positions_state.csv` — Intended positions saved by the trading script.
+- `data/ib_positions_*.csv` — Snapshots of current IBKR positions.
+- `data/shortstock_snapshots/` — Historical short borrow files and comparisons used for alerts.
 
-Screens the investable universe
-
-Generates long/short portfolio targets
-
-Executes or simulates trades
-
-Monitors borrow constraints
-
-Sends a consolidated daily email with trading and short-stock insights
