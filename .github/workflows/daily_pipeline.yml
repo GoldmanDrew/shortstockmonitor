@@ -1,0 +1,71 @@
+name: Daily ETF Pipeline
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch: {}
+
+env:
+  PYTHONUNBUFFERED: '1'
+  GITHUB_WORKSPACE: ${{ github.workspace }}
+  CAGR_CSV: ${{ github.workspace }}/config/etf_cagr.csv
+  OUTPUT_DIR: ${{ github.workspace }}/data
+  OUTPUT_FILE: ${{ github.workspace }}/data/etf_screened_today.csv
+  SCREENED_CSV: ${{ github.workspace }}/data/etf_screened_today.csv
+  SNAPSHOT_DIR: data/shortstock_snapshots
+  IBKR_FTP_FILE: usa.txt
+
+jobs:
+  run-daily-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run ETF screener
+        env:
+          IBKR_FTP_HOST: ${{ secrets.IBKR_FTP_HOST }}
+          IBKR_FTP_USER: ${{ secrets.IBKR_FTP_USER }}
+          IBKR_FTP_PASS: ${{ secrets.IBKR_FTP_PASS }}
+          IBKR_FTP_FILE: ${{ env.IBKR_FTP_FILE }}
+          BORROW_CAP: ${{ secrets.BORROW_CAP || '0.10' }}
+          MIN_SHARES_AVAILABLE: ${{ secrets.MIN_SHARES_AVAILABLE || '1000' }}
+        run: |
+          python etf_screener.py
+
+      - name: Run IBKR algo
+        env:
+          IB_HOST: ${{ secrets.IB_HOST }}
+          IB_PORT: ${{ secrets.IB_PORT || '7497' }}
+          IB_CLIENT_ID: ${{ secrets.IB_CLIENT_ID || '3' }}
+          DRY_RUN: ${{ secrets.IBKR_DRY_RUN || '1' }}
+          SCREENED_CSV: ${{ env.SCREENED_CSV }}
+        run: |
+          python ibkr_algo.py
+
+      - name: Run short stock monitor
+        env:
+          IBKR_FTP_HOST: ${{ secrets.IBKR_FTP_HOST }}
+          IBKR_FTP_USER: ${{ secrets.IBKR_FTP_USER }}
+          IBKR_FTP_PASS: ${{ secrets.IBKR_FTP_PASS }}
+          IBKR_FTP_FILE: ${{ env.IBKR_FTP_FILE }}
+          SCREENED_CSV: ${{ env.SCREENED_CSV }}
+          SNAPSHOT_DIR: ${{ env.SNAPSHOT_DIR }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM || 'example@example.com' }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO || 'example@example.com' }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST || 'smtp.gmail.com' }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+          SMTP_USER: ${{ secrets.SMTP_USER || '' }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS || '' }}
+        run: |
+          python short_stock_monitor.py
