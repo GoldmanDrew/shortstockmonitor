@@ -56,14 +56,15 @@ OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", str(REPO_ROOT / "data")))
 OUTPUT_FILE = Path(os.getenv("OUTPUT_FILE", str(OUTPUT_DIR / "etf_screened_today.csv")))
 
 # IBKR FTP config
-FTP_HOST = os.getenv("IBKR_FTP_HOST", "ftp2.interactivebrokers.com")
-FTP_USER = os.getenv("IBKR_FTP_USER", "shortstock")
-FTP_PASS = os.getenv("IBKR_FTP_PASS", "")
-FTP_FILE = os.getenv("IBKR_FTP_FILE", "usa.txt")  # usa.txt by default
+# IMPORTANT: use `or` so empty strings injected by CI don't override defaults
+FTP_HOST = os.getenv("IBKR_FTP_HOST") or "ftp2.interactivebrokers.com"
+FTP_USER = os.getenv("IBKR_FTP_USER") or "shortstock"
+FTP_PASS = os.getenv("IBKR_FTP_PASS") or ""
+FTP_FILE = os.getenv("IBKR_FTP_FILE") or "usa.txt"
 
 # Screening thresholds
-BORROW_CAP = float(os.getenv("BORROW_CAP", "0.10"))                  # 10% "cheap" borrow cap - can also maybe loosen?
-MIN_SHARES_AVAILABLE = int(os.getenv("MIN_SHARES_AVAILABLE", "1000"))  # minimum shortable - can start with 1000 and loosen to 500
+BORROW_CAP = float(os.getenv("BORROW_CAP", "0.10"))                   # 10% "cheap" borrow cap
+MIN_SHARES_AVAILABLE = int(os.getenv("MIN_SHARES_AVAILABLE", "1000")) # minimum shortable
 
 
 @dataclass
@@ -86,14 +87,32 @@ def fetch_ibkr_shortstock_file(filename: str = FTP_FILE) -> pd.DataFrame:
       - Build lowercase column names from it
       - Parse the remaining lines as data
     """
-    print(f"Connecting to IBKR FTP: {FTP_HOST}, file: {filename}")
-    ftp = ftplib.FTP(FTP_HOST)
-    ftp.login(user=FTP_USER, passwd=FTP_PASS)
+    if not FTP_HOST:
+        raise RuntimeError("IBKR_FTP_HOST is empty/unset.")
+    if not FTP_USER:
+        raise RuntimeError("IBKR_FTP_USER is empty/unset.")
 
-    buf = io.BytesIO()
-    ftp.retrbinary(f"RETR {filename}", buf.write)
-    ftp.quit()
-    print("FTP download complete, parsing...")
+    print(f"Connecting to IBKR FTP: {FTP_HOST}, file: {filename}")
+
+    # Make connection explicit so we never hit ftp.sock == None in login()
+    ftp = ftplib.FTP(timeout=30)
+    try:
+        ftp.connect(FTP_HOST, 21)
+        ftp.login(user=FTP_USER, passwd=FTP_PASS)
+        ftp.set_pasv(True)  # often helps on CI runners / firewalls
+
+        buf = io.BytesIO()
+        ftp.retrbinary(f"RETR {filename}", buf.write)
+        print("FTP download complete, parsing...")
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            # if quit fails (connection already dropped), ensure close
+            try:
+                ftp.close()
+            except Exception:
+                pass
 
     buf.seek(0)
     text = buf.getvalue().decode("utf-8", errors="ignore")
@@ -197,7 +216,7 @@ def get_ibkr_borrow_snapshot_from_ftp(etf_list: Iterable[str]) -> pd.DataFrame:
         })
 
     df_out = pd.DataFrame(records)
-    df_out["borrow_spiking"] = False  # placeholder; can compute trend later if temporarily the borrow is 4% and jumps to 13% it depends for how long --> we don't want to be paying high borrow too long. if the borrow rate goes over 12% then we cover?
+    df_out["borrow_spiking"] = False  # placeholder
     return df_out
 
 
