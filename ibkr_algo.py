@@ -18,11 +18,11 @@ High-level workflow:
 
 5) On first run (no positions_state.csv and no IB positions):
    - Read NetLiquidation (account equity)
-   - Allocate 50% to CC leg, 50% to LEV2 leg
+   - Allocate 50% (x) to CC leg, 50% (100-x) to LEV2 leg
    - For:
        CC leg: long 1x underlying, short 1x CC ETF, NEVER rebalance.
        LEV2 leg: long 1x underlying, short 0.5x 2x ETF, rebalance in future.
-   - Use Adaptive Passive limit orders with retries.
+   - Use Adaptive limit orders (configurable priority: Patient/Normal/Urgent).
    - If one leg of a pair fills but the other fails, we flatten the filled leg.
      We retry the pair up to 3 times before giving up.
 
@@ -77,7 +77,24 @@ MAX_SHARES_PER_ORDER = int(os.getenv("MAX_SHARES_PER_ORDER", "500"))
 # 0 = send real orders; 1 = only log (no orders)
 DRY_RUN = bool(int(os.getenv("DRY_RUN", "0")))
 
-MARKET_DATA_MODE = "DELAYED"
+MARKET_DATA_MODE = os.getenv("MARKET_DATA_MODE", "DELAYED")
+
+# Adaptive algo priority: must be one of "Patient", "Normal", "Urgent"
+ADAPTIVE_PRIORITY = os.getenv("ADAPTIVE_PRIORITY", "Patient").strip().capitalize()
+if ADAPTIVE_PRIORITY not in ("Patient", "Normal", "Urgent"):
+    print(
+        f"[CONFIG] Invalid ADAPTIVE_PRIORITY='{ADAPTIVE_PRIORITY}' supplied; "
+        "falling back to 'Patient'."
+    )
+    ADAPTIVE_PRIORITY = "Patient"
+
+# Execution mode:
+#   LIMIT   - use plain limit orders around ref price (default, recommended)
+#   ADAPTIVE - use IB Adaptive algo (requires robust market data)
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "LIMIT").strip().upper()
+if EXECUTION_MODE not in ("LIMIT", "ADAPTIVE"):
+    print(f"[CONFIG] Invalid EXECUTION_MODE='{EXECUTION_MODE}', falling back to 'LIMIT'.")
+    EXECUTION_MODE = "LIMIT"
 
 # --------------------------------------------------
 # BASIC DATA STRUCTURES
@@ -190,127 +207,148 @@ def connect_ib() -> IB:
 # --------------------------------------------------
 # MARKET DATA: PRICES (LIVE / DELAYED MODES)
 # --------------------------------------------------
-
 def get_last_prices(ib: IB, symbols: List[str]) -> Dict[str, float]:
     """
     Fetch a 'reasonable' price for each universal symbol.
 
     If MARKET_DATA_MODE == "LIVE":
-        - Use real-time snapshot (mid/last/close/marketPrice).
-        - Fall back to 1-day historical close.
+        For each symbol:
+          1) Try LIVE snapshot (marketDataType=1):
+             - rt_mid (bid/ask)
+             - rt_last
+             - rt_close
+             - marketPrice()
+          2) If no live price, try DELAYED snapshot (marketDataType=3):
+             - delayed_mid (delayedBid/delayedAsk)
+             - delayed_last
+             - delayed_close
+             - fall back to any rt_* fields IB might populate
+          3) If still nothing, use 1-day historical close.
 
     If MARKET_DATA_MODE == "DELAYED":
-        - Do NOT request live or delayed streaming data.
-        - Only pull 1-day historical bars and use the close.
-        - This avoids market-data subscription errors (10089).
+        For each symbol:
+          1) Try DELAYED snapshot (marketDataType=3):
+             - delayed_mid, delayed_last, delayed_close, or rt_* fields
+          2) If nothing, use 1-day historical close.
     """
-
-    prices: Dict[str, float] = {}
 
     def safe(v):
         return v if (v is not None and isinstance(v, (int, float)) and v > 0) else None
 
-    # ---------------------------
-    # LIVE MODE: use reqMktData
-    # ---------------------------
-    if MARKET_DATA_MODE == "LIVE":
-        # 1 = live market data
-        ib.reqMarketDataType(1)
+    prices: Dict[str, float] = {}
 
-        for sym in symbols:
-            sym_u = sym.upper().strip()
-            contract = make_stock(sym_u)
-            ib.qualifyContracts(contract)
+    mode = str(MARKET_DATA_MODE).upper().strip()
+    if mode not in ("LIVE", "DELAYED"):
+        print(f"[PRICE] Unknown MARKET_DATA_MODE='{MARKET_DATA_MODE}', defaulting to 'DELAYED'.")
+        mode = "DELAYED"
 
-            ticker = ib.reqMktData(contract, "", snapshot=True)
+    for sym in symbols:
+        sym_u = sym.upper().strip()
+        contract = make_stock(sym_u)
+        ib.qualifyContracts(contract)
 
-            # wait briefly for data to populate
-            for _ in range(10):
-                ib.sleep(0.5)
-                if any([
-                    safe(ticker.bid),
-                    safe(ticker.ask),
-                    safe(ticker.last),
-                    safe(ticker.close),
-                    safe(ticker.marketPrice()),
-                ]):
-                    break
+        price: Optional[float] = None
+        source: Optional[str] = None
 
-            rt_bid  = safe(ticker.bid)
-            rt_ask  = safe(ticker.ask)
-            rt_last = safe(ticker.last)
-            close_px = safe(ticker.close)
-            mkt_px   = safe(ticker.marketPrice())
-
-            price = None
-            source = None
-
-            # LIVE priority: rt_mid, rt_last, close, marketPrice
-            if rt_bid and rt_ask:
-                price = (rt_bid + rt_ask) / 2.0
-                source = "rt_mid"
-            elif rt_last:
-                price = rt_last
-                source = "rt_last"
-            elif close_px:
-                price = close_px
-                source = "close"
-            elif mkt_px:
-                price = mkt_px
-                source = "marketPrice"
-
-            # Fallback to 1-day historical close if still None
-            if price is None:
-                try:
-                    bars = ib.reqHistoricalData(
-                        contract,
-                        endDateTime="",
-                        durationStr="1 D",
-                        barSizeSetting="1 day",
-                        whatToShow="TRADES",
-                        useRTH=True,
-                        formatDate=1,
-                        keepUpToDate=False,
-                    )
-                    if bars:
-                        price = safe(bars[-1].close)
-                        source = "hist_close"
-                except Exception as e:
-                    print(f"[PRICE] {sym_u}: error fetching historical data: {e}")
-
-            if price is None:
-                price = float("nan")
-                source = "none"
-
-            prices[sym_u] = price
-
-            if source == "none":
-                print(f"[PRICE] {sym_u}: no usable price (all sources empty)")
-            elif source == "hist_close":
-                print(f"[PRICE] {sym_u}: {price:.4f} ({source}, non-real-time)")
-            else:
-                print(f"[PRICE] {sym_u}: {price:.4f} ({source})")
-
-            # Clean up the snapshot subscription
+        # ------------------------------------------------
+        # Helper: request a single snapshot with a given
+        # market data type (1=live, 3=delayed)
+        # ------------------------------------------------
+        def snapshot_with_type(data_type: int, label: str) -> Tuple[Optional[float], Optional[str]]:
+            """
+            Returns (price, source_label) or (None, None) if no usable price.
+            label is "live" or "delayed" purely for logging.
+            """
+            print(f"[PRICE] {sym_u}: requesting {label} snapshot (type={data_type})")
             try:
-                ib.cancelMktData(contract)
-            except Exception:
-                pass
+                ib.reqMarketDataType(data_type)
+                ticker = ib.reqMktData(contract, "", snapshot=True)
 
-    # ------------------------------
-    # DELAYED MODE: hist close only
-    # ------------------------------
-    else:  # MARKET_DATA_MODE == "DELAYED"
-        # No reqMarketDataType / reqMktData at all;
-        # we only use 1-day historical bars.
-        for sym in symbols:
-            sym_u = sym.upper().strip()
-            contract = make_stock(sym_u)
-            ib.qualifyContracts(contract)
+                # Let data populate
+                for _ in range(10):
+                    ib.sleep(0.5)
+                    rt_bid  = safe(getattr(ticker, "bid", None))
+                    rt_ask  = safe(getattr(ticker, "ask", None))
+                    rt_last = safe(getattr(ticker, "last", None))
+                    rt_close = safe(getattr(ticker, "close", None))
+                    rt_mkt  = safe(ticker.marketPrice())
 
-            price = None
-            source = None
+                    d_bid   = safe(getattr(ticker, "delayedBid", None))
+                    d_ask   = safe(getattr(ticker, "delayedAsk", None))
+                    d_last  = safe(getattr(ticker, "delayedLast", None))
+                    d_close = safe(getattr(ticker, "delayedClose", None))
 
+                    if any([rt_bid, rt_ask, rt_last, rt_close, rt_mkt,
+                            d_bid, d_ask, d_last, d_close]):
+                        break
+
+                # Re-read after waiting
+                rt_bid  = safe(getattr(ticker, "bid", None))
+                rt_ask  = safe(getattr(ticker, "ask", None))
+                rt_last = safe(getattr(ticker, "last", None))
+                rt_close = safe(getattr(ticker, "close", None))
+                rt_mkt  = safe(ticker.marketPrice())
+
+                d_bid   = safe(getattr(ticker, "delayedBid", None))
+                d_ask   = safe(getattr(ticker, "delayedAsk", None))
+                d_last  = safe(getattr(ticker, "delayedLast", None))
+                d_close = safe(getattr(ticker, "delayedClose", None))
+
+                if label == "live":
+                    # Prefer live, then delayed
+                    if rt_bid and rt_ask:
+                        return (rt_bid + rt_ask) / 2.0, "rt_mid"
+                    if rt_last:
+                        return rt_last, "rt_last"
+                    if rt_close:
+                        return rt_close, "rt_close"
+                    if rt_mkt:
+                        return rt_mkt, "rt_marketPrice"
+                    if d_bid and d_ask:
+                        return (d_bid + d_ask) / 2.0, "delayed_mid"
+                    if d_last:
+                        return d_last, "delayed_last"
+                    if d_close:
+                        return d_close, "delayed_close"
+                else:  # label == "delayed"
+                    # Prefer delayed, then any live fields IB gives us anyway
+                    if d_bid and d_ask:
+                        return (d_bid + d_ask) / 2.0, "delayed_mid"
+                    if d_last:
+                        return d_last, "delayed_last"
+                    if d_close:
+                        return d_close, "delayed_close"
+                    if rt_bid and rt_ask:
+                        return (rt_bid + rt_ask) / 2.0, "rt_mid"
+                    if rt_last:
+                        return rt_last, "rt_last"
+                    if rt_close:
+                        return rt_close, "rt_close"
+                    if rt_mkt:
+                        return rt_mkt, "rt_marketPrice"
+
+            except Exception as e:
+                print(f"[PRICE] {sym_u}: error requesting {label} snapshot (type={data_type}): {e}")
+            finally:
+                try:
+                    ib.cancelMktData(contract)
+                except Exception:
+                    pass
+
+            print(f"[PRICE] {sym_u}: no usable {label} snapshot")
+            return None, None
+
+        # 1) If mode=LIVE, try live snapshot first
+        if mode == "LIVE":
+            price, source = snapshot_with_type(1, "live")
+
+        # 2) If still None (or mode=DELAYED), try delayed snapshot
+        if price is None:
+            price, source = snapshot_with_type(3, "delayed")
+
+        # 3) Historical close as final fallback
+        if price is None:
+            print(f"[PRICE] {sym_u}: falling back to 1D historical close")
             try:
                 bars = ib.reqHistoricalData(
                     contract,
@@ -328,37 +366,69 @@ def get_last_prices(ib: IB, symbols: List[str]) -> Dict[str, float]:
             except Exception as e:
                 print(f"[PRICE] {sym_u}: error fetching historical data: {e}")
 
-            if price is None:
-                price = float("nan")
-                source = "none"
+        if price is None:
+            price = float("nan")
+            source = "none"
 
-            prices[sym_u] = price
+        prices[sym_u] = price
 
-            if source == "none":
-                print(f"[PRICE] {sym_u}: no usable price (historical)")
-            else:
-                print(f"[PRICE] {sym_u}: {price:.4f} ({source}, non-real-time)")
+        if source == "none":
+            print(f"[PRICE] {sym_u}: no usable price (live+delayed+historical all failed, mode={mode})")
+        else:
+            print(f"[PRICE] {sym_u}: {price:.4f} ({source}, mode={mode})")
 
     return prices
 
+
 # --------------------------------------------------
-# ADAPTIVE PASSIVE ORDER HELPERS
+# ADAPTIVE ORDER HELPERS
 # --------------------------------------------------
 
-def adaptive_passive_order(action: str, quantity: int, limit_price: float) -> Order:
+def adaptive_passive_order(action: str, quantity: int, ref_price: float) -> Order:
     """
-    Build an Adaptive Algo order in PASSIVE mode.
+    Build the order we use for each leg.
+
+    - In EXECUTION_MODE == "LIMIT":
+        Use a plain LIMIT order, priced slightly through the delayed mid.
+        This is robust for paper accounts with delayed data only.
+
+    - In EXECUTION_MODE == "ADAPTIVE":
+        Use IB's Adaptive algo with 'adaptivePriority' (Patient/Normal/Urgent).
+        Only recommended if you have proper live/delayed subscriptions.
     """
+    action = action.upper()
+    qty = int(quantity)
+    px = float(ref_price)
+
     o = Order()
-    o.action = action.upper()             # "BUY" or "SELL"
-    o.totalQuantity = int(quantity)
-    o.orderType = "LMT"
-    o.lmtPrice = float(limit_price)
+    o.action = action
+    o.totalQuantity = qty
     o.tif = "DAY"
 
+    if EXECUTION_MODE == "LIMIT":
+        # How aggressive should we be? bps offset from ref price
+        # e.g. 10 bps = 0.10% through the mid.
+        bps = float(os.getenv("LIMIT_BPS_OFFSET", "10"))  # 10 bps default
+        offset = px * (bps / 10_000.0)
+
+        if action == "BUY":
+            lmt = px + offset
+        else:  # SELL
+            lmt = px - offset
+
+        o.orderType = "LMT"
+        o.lmtPrice = round(lmt, 4)
+        print(f"[ORDER] {action} {qty} @ LMT {o.lmtPrice:.4f} (ref={px:.4f}, {bps}bps, mode=LIMIT)")
+        return o
+
+    # EXECUTION_MODE == "ADAPTIVE"
+    o.orderType = "LMT"
+    o.lmtPrice = px
     o.algoStrategy = "Adaptive"
-    o.algoParams = [TagValue("adaptivePriority", "Passive")]
+    o.algoParams = [TagValue("adaptivePriority", ADAPTIVE_PRIORITY)]
+    print(f"[ORDER] {action} {qty} @ LMT {o.lmtPrice:.4f} (Adaptive {ADAPTIVE_PRIORITY})")
     return o
+
 
 
 def wait_for_trade_completion(
@@ -388,7 +458,12 @@ def execute_leg_adaptive(
     timeout: float = 60.0,
 ) -> Tuple[bool, Optional[Trade]]:
     """
-    Execute one leg (BUY or SELL) using Adaptive Passive algo with retries.
+    Execute one leg (BUY or SELL) with retries.
+
+    - If EXECUTION_MODE = LIMIT:
+        Use a simple LMT order priced off `limit_price` with a small bps offset.
+    - If EXECUTION_MODE = ADAPTIVE:
+        Use IB Adaptive algo with priority ADAPTIVE_PRIORITY.
 
     Returns (success, Trade).
       - success=True means fully filled
@@ -409,33 +484,41 @@ def execute_leg_adaptive(
     trade: Optional[Trade] = None
 
     for attempt in range(1, max_retries + 1):
-        print(f"[LEG] Attempt {attempt}/{max_retries}: {action} {quantity} {symbol} @ ~{limit_price:.4f} (Adaptive Passive)")
+        print(
+            f"[LEG] Attempt {attempt}/{max_retries}: {action.upper()} {quantity} {symbol} "
+            f"@ ~{limit_price:.4f} (mode={EXECUTION_MODE}, priority={ADAPTIVE_PRIORITY})"
+        )
 
         order = adaptive_passive_order(action, quantity, limit_price)
 
         if DRY_RUN:
-            print(f"[DRY_RUN] Would place order: {action} {quantity} {symbol}")
+            print(f"[DRY_RUN] Would place order: {action.upper()} {quantity} {symbol}")
             return True, None
 
         trade = ib.placeOrder(contract, order)
         trade = wait_for_trade_completion(trade, timeout=timeout)
 
-        status = trade.orderStatus.status
-        filled = trade.orderStatus.filled
-        remaining = trade.orderStatus.remaining
+        status = trade.orderStatus.status or ""
+        filled = trade.orderStatus.filled or 0
+        remaining = trade.orderStatus.remaining or 0
 
         print(f"[LEG] {symbol} status={status}, filled={filled}, remaining={remaining}")
 
+        # If fully filled, done
         if status.lower() in ("filled", "partiallyfilled") and remaining == 0:
             return True, trade
 
-        if not trade.isDone():
-            print(f"[LEG] Cancelling live order for {symbol} (not done within timeout).")
+        # If order still working after timeout, cancel and retry
+        if status.lower() in ("presubmitted", "submitted", "pendingsubmit"):
+            print(f"[LEG] Cancelling working order for {symbol} after timeout (status={status}).")
             ib.cancelOrder(order)
             time.sleep(1.0)
+        elif status.lower() in ("cancelled", "apicancelled", "inactive", "rejected"):
+            print(f"[LEG] Order for {symbol} ended in terminal status={status}, will retry if attempts remain.")
 
-    print(f"[LEG] FAILED: {action} {quantity} {symbol} after {max_retries} attempts.")
+    print(f"[LEG] FAILED: {action.upper()} {quantity} {symbol} after {max_retries} attempts.")
     return False, trade
+
 
 
 def flatten_leg(
@@ -467,6 +550,7 @@ def flatten_leg(
     if not success:
         print(f"[SAFETY] WARNING: Could not fully flatten {symbol}!")
 
+
 def execute_pair(
     ib: IB,
     pair: Pair,
@@ -483,7 +567,7 @@ def execute_pair(
         - LONG underlying (BUY qty_underlying)
         - SHORT ETF (SELL qty_etf_short)
 
-    Uses Adaptive Passive orders with retries.
+    Uses Adaptive orders with retries.
 
     Logic:
       - Try to execute both legs up to pair_max_retries times.
@@ -687,6 +771,9 @@ def initialize_portfolio(ib: IB, pairs: List[Pair]) -> None:
       - Split capital 50/50: CC vs LEV2
       - For CC pairs: long 1x underlying, short 1x CC ETF
       - For LEV2 pairs: long 1x underlying, short 0.5x 2x ETF
+
+    This function sends orders but does not return a state DataFrame.
+    After calling it, you should sync from IB using sync_state_from_ib().
     """
     equity = get_account_equity(ib)
 
@@ -1012,8 +1099,9 @@ def main():
     #    run your rebalance / maintenance logic here.
     if state_df.empty and not ib.positions():
         print("No existing IB positions and no state; initializing portfolio fresh.")
-        state_df = initialize_portfolio(ib, pairs)
-        save_state(state_df)
+        initialize_portfolio(ib, pairs)
+        # After sending initial orders, re-sync state from IB
+        state_df = sync_state_from_ib(ib, pairs)
     else:
         print(
             "Existing positions/state found; "
@@ -1026,3 +1114,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+#Initially we should definitely have a trade by trade acceptance by the user

@@ -62,8 +62,8 @@ FTP_PASS = os.getenv("IBKR_FTP_PASS", "")
 FTP_FILE = os.getenv("IBKR_FTP_FILE", "usa.txt")  # usa.txt by default
 
 # Screening thresholds
-BORROW_CAP = float(os.getenv("BORROW_CAP", "0.10"))                  # 10% "cheap" borrow cap
-MIN_SHARES_AVAILABLE = int(os.getenv("MIN_SHARES_AVAILABLE", "1000"))  # minimum shortable
+BORROW_CAP = float(os.getenv("BORROW_CAP", "0.10"))                  # 10% "cheap" borrow cap - can also maybe loosen?
+MIN_SHARES_AVAILABLE = int(os.getenv("MIN_SHARES_AVAILABLE", "1000"))  # minimum shortable - can start with 1000 and loosen to 500
 
 
 @dataclass
@@ -197,7 +197,7 @@ def get_ibkr_borrow_snapshot_from_ftp(etf_list: Iterable[str]) -> pd.DataFrame:
         })
 
     df_out = pd.DataFrame(records)
-    df_out["borrow_spiking"] = False  # placeholder; can compute trend later
+    df_out["borrow_spiking"] = False  # placeholder; can compute trend later if temporarily the borrow is 4% and jumps to 13% it depends for how long --> we don't want to be paying high borrow too long. if the borrow rate goes over 12% then we cover?
     return df_out
 
 

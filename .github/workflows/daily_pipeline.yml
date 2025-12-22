@@ -43,16 +43,6 @@ jobs:
         run: |
           python etf_screener.py
 
-      - name: Run IBKR algo
-        env:
-          IB_HOST: ${{ secrets.IB_HOST }}
-          IB_PORT: ${{ secrets.IB_PORT || '7497' }}
-          IB_CLIENT_ID: ${{ secrets.IB_CLIENT_ID || '3' }}
-          DRY_RUN: ${{ secrets.IBKR_DRY_RUN || '1' }}
-          SCREENED_CSV: ${{ env.SCREENED_CSV }}
-        run: |
-          python ibkr_algo.py
-
       - name: Run short stock monitor
         env:
           IBKR_FTP_HOST: ${{ secrets.IBKR_FTP_HOST }}
