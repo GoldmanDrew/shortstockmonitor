@@ -133,13 +133,45 @@ def main():
     screened["strategy_tag"] = tag
 
     # ------------------------
-    # Output
+    # Formatting + column cleanup
     # ------------------------
 
-    proposed_csv.parent.mkdir(parents=True, exist_ok=True)
-    screened.to_csv(proposed_csv, index=False)
+    # 1) Round CAGR-related columns to 4 decimals
+    cagr_cols = [c for c in screened.columns if "cagr" in c.lower()]
+    for c in cagr_cols:
+        screened[c] = screened[c].round(4)
 
-    print(f"[OK] Wrote proposed trades → {proposed_csv}")
+    # 2) Round borrow-related columns to 4 decimals
+    borrow_cols = [c for c in screened.columns if "borrow" in c.lower()]
+    for c in borrow_cols:
+        screened[c] = screened[c].round(4)
+
+    # 3) Round capital / USD columns to 2 decimals
+    usd_cols = [c for c in screened.columns if c.lower().endswith("_usd")]
+    for c in usd_cols:
+        screened[c] = screened[c].round(2)
+
+
+    # ------------------------
+    # Output (ONLY proposed trades)
+    # ------------------------
+    proposed = screened[screened["include_for_algo"] == True].copy()
+
+    # Optional safety: drop any zero-sized rows (in case include_for_algo is True but sizing failed)
+    proposed = proposed[(proposed["long_usd"] != 0) | (proposed["short_usd"] != 0)]
+
+    cols_to_drop = [
+        "LevType",
+        "cagr_positive",
+        "include_for_algo",
+    ]
+    proposed = proposed.drop(columns=[c for c in cols_to_drop if c in proposed.columns])
+
+    proposed_csv.parent.mkdir(parents=True, exist_ok=True)
+    proposed.to_csv(proposed_csv, index=False)
+
+    print(f"[OK] Wrote proposed trades → {proposed_csv}  (n={len(proposed)})")
+
 
 
 if __name__ == "__main__":
