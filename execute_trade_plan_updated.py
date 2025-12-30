@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 
 import pandas as pd
-from ib_insync import IB, Stock, Order, Trade, MarketOrder
+from ib_insync import IB, Stock, Order, Trade, MarketOrder, TagValue
 import yaml
 
 
@@ -203,6 +203,60 @@ def get_snapshot_price(ib: IB, symbol: str, prefer_delayed: bool = True) -> floa
     return float(px)
 
 
+def get_hist_ref_price(ib: IB, symbol: str) -> float:
+    """
+    Reference price that does NOT require real-time market data subscriptions.
+    Uses historical bars (5-min close, RTH) with a 1-day fallback.
+
+    This avoids Error 10089 (market data subscription required) and is stable for sizing/limits.
+    """
+    sym_u = symbol.upper()
+    contract = make_stock(sym_u)
+    ib.qualifyContracts(contract)
+
+    # 5-min bars first (more current)
+    try:
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr="2 D",
+            barSizeSetting="5 mins",
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+            keepUpToDate=False,
+        )
+    except Exception:
+        bars = []
+
+    if bars:
+        px = safe_price(bars[-1].close)
+        if px is not None:
+            return float(px)
+
+    # Daily fallback
+    try:
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr="10 D",
+            barSizeSetting="1 day",
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+            keepUpToDate=False,
+        )
+    except Exception:
+        bars = []
+
+    if bars:
+        px = safe_price(bars[-1].close)
+        if px is not None:
+            return float(px)
+
+    raise RuntimeError(f"No usable historical reference price for {sym_u}")
+
+
 # ---------------------------
 # Orders
 # ---------------------------
@@ -222,6 +276,40 @@ def build_limit_order(action: str, qty: int, ref_price: float, bps: float, order
     else:
         o.lmtPrice = round(ref_price - offset, 4)
     o.orderRef = order_ref
+    return o
+
+
+def build_marketable_limit_with_cap(action: str, qty: int, ref_price: float, cap_bps: float, order_ref: str) -> Order:
+    """
+    Market-like execution with price protection.
+
+    For BUY: limit = ref_price * (1 + cap_bps)
+    For SELL: limit = ref_price * (1 - cap_bps)
+
+    This gives high fill probability while preventing extreme slippage vs a true market order.
+    """
+    o = Order()
+    o.action = action.upper()
+    o.totalQuantity = int(qty)
+    o.tif = "DAY"
+    o.orderType = "LMT"
+    cap = ref_price * (cap_bps / 10_000.0)
+    if o.action == "BUY":
+        o.lmtPrice = round(ref_price + cap, 4)
+    else:
+        o.lmtPrice = round(ref_price - cap, 4)
+    o.orderRef = order_ref
+    return o
+
+
+def build_adaptive_limit_with_cap(action: str, qty: int, ref_price: float, cap_bps: float, order_ref: str, priority: str = "Urgent") -> Order:
+    """
+    IBKR Adaptive algo (market-like) WITH a limit cap for protection.
+    Priority: "Urgent" (higher fill probability), "Normal", "Patient".
+    """
+    o = build_marketable_limit_with_cap(action, qty, ref_price, cap_bps, order_ref)
+    o.algoStrategy = "Adaptive"
+    o.algoParams = [TagValue("adaptivePriority", str(priority))]
     return o
 
 WARNING_ERROR_CODES = {10349}
@@ -426,25 +514,46 @@ def execute_leg(
         if remain <= 0:
             break
 
-        ref_px_now = get_snapshot_price(ib, symbol, prefer_delayed=bool(exec_cfg.get("prefer_delayed", True)))
-        bps_now = bps + (attempt - 1) * aggressive_step_bps
-        use_market = (market_fallback_third_try and attempt == 3)
+        # Reference price for execution: use historical bars to avoid 10089 market data entitlement issues.
+        # (We keep the 'ref_price' argument for logging/compat; but always re-pull a fresh hist ref here.)
+        ref_px_now = get_hist_ref_price(ib, symbol)
+
+        # Execution style: market-like with cap (recommended) or MKT fallback.
+        primary_style = str(exec_cfg.get("primary_order_style", "MARKETABLE_LIMIT")).upper().strip()
+        max_slip_bps = float(exec_cfg.get("max_slippage_bps", 50.0))          # hard cap vs ref
+        widen_once_bps = float(exec_cfg.get("widen_once_bps", 50.0))          # widen on later attempts
+        adaptive_priority = str(exec_cfg.get("adaptive_priority", "Urgent"))
+
+        cap_bps = max_slip_bps + (attempt - 1) * widen_once_bps
+
+        use_market = (primary_style == "MKT") or (market_fallback_third_try and attempt == 3 and bool(exec_cfg.get("allow_mkt_fallback", False)))
 
         if use_market:
             o = MarketOrder(action, remain)
-            o.tif = "DAY"              # be explicit
-            o.transmit = True          # be explicit
+            o.tif = "DAY"
+            o.transmit = True
             o.orderRef = f"{order_ref}|att{attempt}|MKT"
             px_str = "MKT"
         else:
-            o = build_limit_order(
-                action=action,
-                qty=remain,
-                ref_price=ref_px_now,
-                bps=bps_now,
-                order_ref=f"{order_ref}|att{attempt}|LMT",
-            )
-            o.transmit = True          # be explicit
+            if primary_style == "ADAPTIVE_LIMIT":
+                o = build_adaptive_limit_with_cap(
+                    action=action,
+                    qty=remain,
+                    ref_price=ref_px_now,
+                    cap_bps=cap_bps,
+                    order_ref=f"{order_ref}|att{attempt}|ADAPT|CAP{cap_bps:.0f}",
+                    priority=adaptive_priority,
+                )
+            else:
+                # Default: marketable limit with cap
+                o = build_marketable_limit_with_cap(
+                    action=action,
+                    qty=remain,
+                    ref_price=ref_px_now,
+                    cap_bps=cap_bps,
+                    order_ref=f"{order_ref}|att{attempt}|MLMT|CAP{cap_bps:.0f}",
+                )
+            o.transmit = True
             px_str = f"{o.lmtPrice:.4f}"
 
         print(f"[LEG] {symbol} {action} qty={remain} ref_now={ref_px_now:.4f} bps_now={bps_now:.1f} px={px_str} refTag={o.orderRef}")
@@ -471,8 +580,9 @@ def execute_leg(
             cancel_and_wait_with_resync(ib, trade, timeout=cancel_timeout)
             continue
 
+        fill_wait = float(exec_cfg.get("fill_wait_sec", 20.0))
         done_timeout = float(exec_cfg.get("market_done_timeout_sec" if use_market else "limit_done_timeout_sec",
-                                         180.0 if use_market else timeout))
+                                         180.0 if use_market else fill_wait))
         trade = wait_for_trade_terminal(ib, trade, timeout=done_timeout)
 
         status = (trade.orderStatus.status or "").lower()
@@ -676,7 +786,7 @@ def main() -> None:
         symbols = sorted(set(plan["Underlying"].astype(str).str.upper()) | set(plan["ETF"].astype(str).str.upper()))
         prices: Dict[str, float] = {}
         for s in symbols:
-            prices[s] = get_snapshot_price(ib, s, prefer_delayed=prefer_delayed)
+            prices[s] = get_hist_ref_price(ib, s)
 
         # Save execution pricing snapshot
         px_df = pd.DataFrame([{"symbol": k, "price": v} for k, v in prices.items()]).sort_values("symbol")

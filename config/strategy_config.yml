@@ -1,7 +1,7 @@
 ibkr:
   host: 127.0.0.1
   port: 7497
-  client_id: 3
+  client_id: 31 #change to 41 for live
   prefer_delayed: true
 strategy:
   tag: ETF_LS
@@ -18,19 +18,29 @@ paths:
   fills_csv: data/trade_fills.csv
 execution:
   dry_run: false
-  limit_bps: 10.0
-  timeout_sec: 90
+
+  # Execution mode (new)
+  primary_order_style: "MARKETABLE_LIMIT"   # options: MARKETABLE_LIMIT | ADAPTIVE_LIMIT | MKT
+  max_slippage_bps: 50                      # hard cap vs historical ref price (0.50%)
+  widen_once_bps: 0                         # keep 0 to avoid "retry widening" (pure single-cap behavior)
+  fill_wait_sec: 90                         # how long to wait for fill before cancelling
+  # Pair-level behavior
   short_first: true
-  max_retries: 3
-  aggressive_bps_step: 25.0
-  market_fallback_third_try: true
-  accept_timeout_sec: 15
-  market_accept_timeout_sec: 45
+  # Retries: keep at 1 if you truly want "just try once"
+  max_retries: 1
+  # Explicitly disable market fallback behavior
+  allow_mkt_fallback: false
+  # Legacy fields (safe to leave, but ignored by new logic)
+  limit_bps: 25.0
+  timeout_sec: 90
+  aggressive_bps_step: 50.0
+  market_fallback_third_try: false
+  accept_timeout_sec: 90
+  market_accept_timeout_sec: 90
   limit_done_timeout_sec: 90
   market_done_timeout_sec: 180
 screener:
   borrow_cap: 0.12
-  min_shares_available: 1000
   borrow_whitelist_etfs:
   - MSTU
   - MSTY

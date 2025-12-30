@@ -34,8 +34,7 @@ jobs:
 
       - name: Run ETF screener
         env:
-          BORROW_CAP: ${{ secrets.BORROW_CAP || '0.10' }}
-          MIN_SHARES_AVAILABLE: ${{ secrets.MIN_SHARES_AVAILABLE || '1000' }}
+          BORROW_CAP: ${{ secrets.BORROW_CAP || '0.12' }}
         run: |
           python etf_screener.py
 
