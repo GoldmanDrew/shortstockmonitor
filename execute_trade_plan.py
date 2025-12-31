@@ -30,13 +30,12 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Set
 
 import pandas as pd
-from ib_insync import IB, Stock, Order, Trade, MarketOrder
+from ib_insync import IB, Stock, Order, Trade, MarketOrder, TagValue
 import yaml
 
 
@@ -108,7 +107,6 @@ def connect_ib(host: str, port: int, client_id: int) -> IB:
         pass
 
     return ib
-
 
 
 def safe_price(v) -> Optional[float]:
@@ -224,14 +222,37 @@ def build_limit_order(action: str, qty: int, ref_price: float, bps: float, order
     o.orderRef = order_ref
     return o
 
+
+def build_market_order(action: str, qty: int, order_ref: str) -> Order:
+    """Plain market order (no explicit price)."""
+    o = MarketOrder(action.upper(), int(qty))
+    o.tif = "DAY"
+    o.transmit = True
+    o.orderRef = order_ref
+    return o
+
+
+def build_adaptive_market_order(action: str, qty: int, order_ref: str, priority: str = "Normal") -> Order:
+    """IBKR Adaptive algo + market order (no explicit price)."""
+    o = Order()
+    o.action = action.upper()
+    o.totalQuantity = int(qty)
+    o.orderType = "MKT"
+    o.tif = "DAY"
+    o.transmit = True
+    o.orderRef = order_ref
+    o.algoStrategy = "Adaptive"
+    o.algoParams = [TagValue("adaptivePriority", str(priority))]
+    return o
+
+
 WARNING_ERROR_CODES = {10349}
 ORDER_NEVER_LIVE_CANCEL_CODES = {10147}
-import time
-from typing import Optional, Tuple, Set, Dict
 
 # Ensure these exist somewhere in your file
 ACCEPTED: Set[str] = {"presubmitted", "submitted", "filled", "pendingsubmit"}  # you can tweak
 TERMINAL: Set[str] = {"filled", "cancelled", "inactive"}  # IB uses these commonly
+
 
 def _iter_trade_log_entries(trade) -> list:
     """ib_insync Trade.log is a list of TradeLogEntry; be defensive."""
@@ -240,6 +261,7 @@ def _iter_trade_log_entries(trade) -> list:
     except Exception:
         return []
 
+
 def _trade_has_error_code(trade, code: int) -> bool:
     """Return True if Trade.log contains an entry mentioning 'Error <code>'."""
     for e in _iter_trade_log_entries(trade):
@@ -247,6 +269,7 @@ def _trade_has_error_code(trade, code: int) -> bool:
         if f"Error {code}" in msg:
             return True
     return False
+
 
 def _only_warnings(trade) -> bool:
     """
@@ -262,6 +285,7 @@ def _only_warnings(trade) -> bool:
             return False
     return True
 
+
 def _find_any_open_trade_by_order_ref(ib, order_ref: str):
     """
     Find a Trade in ib.trades() matching orderRef, where status is not terminal.
@@ -276,6 +300,7 @@ def _find_any_open_trade_by_order_ref(ib, order_ref: str):
         except Exception:
             continue
     return None
+
 
 def wait_for_trade_terminal(ib, trade, timeout: float = 90.0):
     """
@@ -301,6 +326,7 @@ def wait_for_trade_terminal(ib, trade, timeout: float = 90.0):
         ib.sleep(0.2)
 
     return trade
+
 
 def cancel_and_wait_with_resync(ib, trade, timeout: float = 30.0):
     """
@@ -334,6 +360,7 @@ def cancel_and_wait_with_resync(ib, trade, timeout: float = 30.0):
             trade = wait_for_trade_terminal(ib, live, timeout=timeout)
 
     return trade
+
 
 def wait_for_trade_accepted(ib: IB, trade: Trade, timeout: float = 15.0) -> Tuple[bool, Trade]:
     """Wait until trade reaches an 'accepted' status.
@@ -391,6 +418,7 @@ def wait_for_trade_done(ib: IB, trade: Trade, timeout: float = 90.0) -> Trade:
         ib.sleep(0.2)
     return trade
 
+
 def execute_leg(
     ib: IB,
     symbol: str,
@@ -426,28 +454,73 @@ def execute_leg(
         if remain <= 0:
             break
 
-        ref_px_now = get_snapshot_price(ib, symbol, prefer_delayed=bool(exec_cfg.get("prefer_delayed", True)))
-        bps_now = bps + (attempt - 1) * aggressive_step_bps
-        use_market = (market_fallback_third_try and attempt == 3)
+        # Order routing that does NOT require a price:
+        #   order_style = "ADAPTIVE_MKT"  -> IBKR Adaptive algo + Market
+        #   order_style = "MKT"           -> plain Market
+        # Optional (price-required):
+        #   order_style = "LMT"           -> your limit ladder (uses snapshot price)
+        order_style = str(exec_cfg.get("order_style", "ADAPTIVE_MKT")).strip().upper()
 
-        if use_market:
-            o = MarketOrder(action, remain)
-            o.tif = "DAY"              # be explicit
-            o.transmit = True          # be explicit
-            o.orderRef = f"{order_ref}|att{attempt}|MKT"
-            px_str = "MKT"
-        else:
-            o = build_limit_order(
+        use_market_fallback = (market_fallback_third_try and attempt == 3)
+
+        ref_px_now: Optional[float] = None
+        bps_now: Optional[float] = None
+
+        if order_style == "ADAPTIVE_MKT":
+            if "|UNDER_DELTA" in order_ref:
+                priority = "Urgent"
+            else:
+                priority = "Normal" if attempt == 1 else "Urgent"
+
+            o = build_adaptive_market_order(
                 action=action,
                 qty=remain,
-                ref_price=ref_px_now,
-                bps=bps_now,
-                order_ref=f"{order_ref}|att{attempt}|LMT",
+                order_ref=f"{order_ref}|att{attempt}|ADAPT",
+                priority=priority,
             )
-            o.transmit = True          # be explicit
-            px_str = f"{o.lmtPrice:.4f}"
+            px_str = f"ADAPT_MKT({priority})"
 
-        print(f"[LEG] {symbol} {action} qty={remain} ref_now={ref_px_now:.4f} bps_now={bps_now:.1f} px={px_str} refTag={o.orderRef}")
+
+        elif order_style == "MKT":
+            o = build_market_order(
+                action=action,
+                qty=remain,
+                order_ref=f"{order_ref}|att{attempt}|MKT",
+            )
+            px_str = "MKT"
+
+        else:
+            # Price-required path (original behavior):
+            # Use limit ladder with optional market fallback on the last retry.
+            ref_px_now = get_snapshot_price(ib, symbol, prefer_delayed=bool(exec_cfg.get("prefer_delayed", True)))
+            bps_now = bps + (attempt - 1) * aggressive_step_bps
+
+            if use_market_fallback:
+                o = build_market_order(
+                    action=action,
+                    qty=remain,
+                    order_ref=f"{order_ref}|att{attempt}|MKT",
+                )
+                px_str = "MKT"
+            else:
+                o = build_limit_order(
+                    action=action,
+                    qty=remain,
+                    ref_price=ref_px_now,
+                    bps=bps_now,
+                    order_ref=f"{order_ref}|att{attempt}|LMT",
+                )
+                o.transmit = True
+                px_str = f"{o.lmtPrice:.4f}"
+
+        # Logging: only show ref/bps if we actually used a priced order
+        if ref_px_now is not None and bps_now is not None:
+            print(
+                f"[LEG] {symbol} {action} qty={remain} ref_now={ref_px_now:.4f} "
+                f"bps_now={bps_now:.1f} px={px_str} refTag={o.orderRef}"
+            )
+        else:
+            print(f"[LEG] {symbol} {action} qty={remain} px={px_str} refTag={o.orderRef}")
 
         if dry_run:
             filled_total += remain
@@ -463,7 +536,10 @@ def execute_leg(
             pass
         ib.sleep(0.5)
 
-        accepted, trade = wait_for_trade_accepted(ib, trade, timeout=(market_accept_timeout if use_market else accept_timeout))
+        is_market_like = (str(getattr(o, "orderType", "")) or "").upper() != "LMT"
+        accepted, trade = wait_for_trade_accepted(
+            ib, trade, timeout=(market_accept_timeout if is_market_like else accept_timeout)
+        )
 
         if not accepted:
             st = (trade.orderStatus.status or "")
@@ -471,12 +547,16 @@ def execute_leg(
             cancel_and_wait_with_resync(ib, trade, timeout=cancel_timeout)
             continue
 
-        done_timeout = float(exec_cfg.get("market_done_timeout_sec" if use_market else "limit_done_timeout_sec",
-                                         180.0 if use_market else timeout))
+        done_timeout = float(
+            exec_cfg.get(
+                "market_done_timeout_sec" if is_market_like else "limit_done_timeout_sec",
+                180.0 if is_market_like else timeout,
+            )
+        )
         trade = wait_for_trade_terminal(ib, trade, timeout=done_timeout)
 
         status = (trade.orderStatus.status or "").lower()
-        
+
         filled = int(trade.orderStatus.filled or 0)
         remaining = trade.orderStatus.remaining
         remaining = None if remaining is None else int(remaining)
@@ -586,6 +666,10 @@ def target_shares_from_usd(notional_usd: float, px: float) -> int:
 # ---------------------------
 
 def main() -> None:
+    approve_y_required_first_n = 5
+    pairs_approved_by_y = 0
+    auto_after_first_n = False
+
     CONFIG_YML = Path("config/strategy_config.yml")
 
     ap = argparse.ArgumentParser()
@@ -718,14 +802,17 @@ def main() -> None:
                 print("  [SKIP] Already at target (no deltas).")
                 continue
 
-            if not approve_all:
-                ans = input("Approve this pair? [y]es / [n]o / [a]ll / [q]uit: ").strip().lower()
+            if not auto_after_first_n:
+                ans = input(f"Approve pair {pairs_approved_by_y+1}/{approve_y_required_first_n}? Type 'y' to run, anything else skips, 'q' quits: ").strip().lower()
                 if ans == "q":
                     break
-                if ans == "a":
-                    approve_all = True
-                if ans not in ("y", "a"):
+                if ans != "y":
                     continue
+
+                pairs_approved_by_y += 1
+                if pairs_approved_by_y >= approve_y_required_first_n:
+                    auto_after_first_n = True
+
 
             order_base_ref = f"{strategy_tag}|{pair_id}"
 
