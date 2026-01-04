@@ -38,6 +38,92 @@ import pandas as pd
 from ib_insync import IB, Stock, Order, Trade, MarketOrder, TagValue
 import yaml
 
+import ftplib
+import io
+
+# ---------------------------
+# Short availability (IBKR FTP shortstock)
+# ---------------------------
+
+def fetch_ibkr_short_availability_map(
+    symbols: List[str],
+    ftp_host: str = "ftp2.interactivebrokers.com",
+    ftp_user: str = "shortstock",
+    ftp_pass: str = "",
+    ftp_file: str = "usa.txt",
+) -> Dict[str, Dict[str, Optional[float]]]:
+    """
+    Pull IBKR shortstock file via FTP and return {SYM: {"available": int, "borrow": float}} for requested symbols.
+
+    - "available" is shares available from the file.
+    - "borrow" is net borrow annualized (fee - rebate), clipped at 0, in decimal units (e.g. 0.12 for 12%).
+    """
+    want = {s.upper().strip() for s in symbols if str(s).strip()}
+    if not want:
+        return {}
+
+    ftp = ftplib.FTP(ftp_host)
+    ftp.login(user=ftp_user, passwd=ftp_pass)
+
+    buf = io.BytesIO()
+    ftp.retrbinary(f"RETR {ftp_file}", buf.write)
+    ftp.quit()
+
+    buf.seek(0)
+    text = buf.getvalue().decode("utf-8", errors="ignore")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+
+    header_idx = None
+    for i, ln in enumerate(lines):
+        if ln.startswith("#SYM|"):
+            header_idx = i
+            break
+    if header_idx is None:
+        print("[SHORT] WARNING: Could not find header '#SYM|' in IBKR FTP file; skipping short availability precheck.")
+        return {}
+
+    header_cols = [c.strip().lstrip("#").lower() for c in lines[header_idx].split("|")]
+    data_lines = lines[header_idx + 1 :]
+
+    # Parse pipe-delimited into DataFrame with no header
+    df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep="|", header=None, engine="python")
+    n_cols = min(len(header_cols), df.shape[1])
+    df = df.iloc[:, :n_cols]
+    df.columns = header_cols[:n_cols]
+
+    if "sym" not in df.columns:
+        print("[SHORT] WARNING: IBKR FTP file missing 'sym' column; skipping short availability precheck.")
+        return {}
+
+    df["sym"] = df["sym"].astype(str).str.upper().str.strip()
+
+    # available shares
+    if "available" in df.columns:
+        df["available_int"] = pd.to_numeric(df["available"], errors="coerce")
+    else:
+        df["available_int"] = pd.NA
+
+    # net borrow = fee - rebate (both are % in file)
+    fee = pd.to_numeric(df.get("feerate", pd.Series([pd.NA] * len(df))), errors="coerce") / 100.0
+    rebate = pd.to_numeric(df.get("rebaterate", pd.Series([pd.NA] * len(df))), errors="coerce") / 100.0
+    net_borrow = (fee - rebate).clip(lower=0)
+
+    df["net_borrow_annual"] = net_borrow
+
+    sub = df[df["sym"].isin(want)].copy()
+
+    out: Dict[str, Dict[str, Optional[float]]] = {}
+    for _, r in sub.iterrows():
+        sym = str(r["sym"])
+        avail = r.get("available_int", pd.NA)
+        borrow = r.get("net_borrow_annual", pd.NA)
+        out[sym] = {
+            "available": None if pd.isna(avail) else int(avail),
+            "borrow": None if pd.isna(borrow) else float(borrow),
+        }
+    return out
+
+
 
 # ---------------------------
 # Symbol normalization
@@ -467,19 +553,17 @@ def execute_leg(
         bps_now: Optional[float] = None
 
         if order_style == "ADAPTIVE_MKT":
+            # Underlying: Urgent only (always)
             if "|UNDER_DELTA" in order_ref:
                 priority = "Urgent"
             else:
-                priority = "Normal" if attempt == 1 else "Urgent"
-
-            o = build_adaptive_market_order(
-                action=action,
-                qty=remain,
-                order_ref=f"{order_ref}|att{attempt}|ADAPT",
-                priority=priority,
-            )
-            px_str = f"ADAPT_MKT({priority})"
-
+                # ETF: Passive -> Normal -> Urgent
+                if attempt == 1:
+                    priority = "Passive"
+                elif attempt == 2:
+                    priority = "Normal"
+                else:
+                    priority = "Urgent"
 
         elif order_style == "MKT":
             o = build_market_order(
@@ -660,6 +744,14 @@ def target_shares_from_usd(notional_usd: float, px: float) -> int:
         raise ValueError("Price must be > 0")
     return int(notional_usd / px)
 
+def scaled_delta(delta_u: int, fill_frac: float) -> int:
+    """
+    Scale delta_u by fill fraction, preserve sign, and round to nearest int.
+    """
+    if fill_frac <= 0:
+        return 0
+    return int(round(delta_u * float(fill_frac)))
+
 
 # ---------------------------
 # Main
@@ -766,6 +858,20 @@ def main() -> None:
         px_df = pd.DataFrame([{"symbol": k, "price": v} for k, v in prices.items()]).sort_values("symbol")
         write_execution_snapshot(run_date, px_df, "prices_snapshot.csv")
 
+        # --- Short availability snapshot (for ETF shorts) ---
+        etf_symbols = sorted(set(plan["ETF"].astype(str).str.upper()))
+        short_map: Dict[str, Dict[str, Optional[float]]] = {}
+        try:
+            short_map = fetch_ibkr_short_availability_map(etf_symbols)
+            print(f"[SHORT] Loaded availability for {len(short_map)}/{len(etf_symbols)} ETFs from IBKR FTP.")
+        except Exception as ex:
+            print(f"[SHORT] WARNING: short availability precheck failed ({ex}); continuing without it.")
+            short_map = {}
+
+        # Cumulative desired targets (fixes repeated-underlying / repeated-ETF issues)
+        desired_target_sh: Dict[str, int] = {}
+
+
         # Manual approval loop (pair-by-pair)
         for _, row in plan.iterrows():
             u = str(row["Underlying"]).upper()
@@ -778,22 +884,30 @@ def main() -> None:
             px_u = float(prices[u])
             px_e = float(prices[e])
 
-            # Targets in shares (ABSOLUTE)
-            target_sh_u = target_shares_from_usd(tu, px_u)
-            target_sh_e = target_shares_from_usd(te, px_e)  # negative for short
+            # Targets in shares for THIS ROW (ABSOLUTE sleeve target)
+            row_target_sh_u = target_shares_from_usd(tu, px_u)
+            row_target_sh_e = target_shares_from_usd(te, px_e)  # negative for short
 
-            # Current strategy-only positions
-            cur_strat_u = float(strat_pos.get(u, 0.0))
-            cur_strat_e = float(strat_pos.get(e, 0.0))
+            # CUMULATIVE desired targets by symbol (fix repeated underlyings / ETFs)
+            desired_target_sh[u] = int(desired_target_sh.get(u, 0) + row_target_sh_u)
+            desired_target_sh[e] = int(desired_target_sh.get(e, 0) + row_target_sh_e)
 
-            # Deltas we need to trade
+            # Current strategy-only positions (should be integral shares; be defensive)
+            cur_strat_u = int(round(float(strat_pos.get(u, 0.0))))
+            cur_strat_e = int(round(float(strat_pos.get(e, 0.0))))
+
+            # Deltas we need to trade to reach the cumulative desired target
+            target_sh_u = int(desired_target_sh[u])
+            target_sh_e = int(desired_target_sh[e])
             delta_u = int(target_sh_u - cur_strat_u)
             delta_e = int(target_sh_e - cur_strat_e)
 
             print("\n" + "-" * 100)
             print(f"[PAIR] {pair_id}")
             print(f"  Prices: u={px_u:.4f} e={px_e:.4f}")
-            print(f"  Target shares: u={target_sh_u:+d} e={target_sh_e:+d}")
+            print(f"  Row target shares: u={row_target_sh_u:+d} e={row_target_sh_e:+d}")
+            print(f"  Cumulative target: u={target_sh_u:+d} e={target_sh_e:+d}")
+
             print(f"  Strategy-only current: u={cur_strat_u:+.0f} e={cur_strat_e:+.0f}")
             print(f"  Delta to trade: u={delta_u:+d} e={delta_e:+d}")
             print(f"  Baseline qty: baseline[u]={baseline.get(u,0):+.0f} baseline[e]={baseline.get(e,0):+.0f}")
@@ -838,6 +952,32 @@ def main() -> None:
 
             # Execute legs (short_first means: trade ETF delta first, then underlying delta)
             if short_first:
+                # Execute ETF delta first
+                filled_e, trade_e = exec_delta(e, delta_e, px_e, "ETF_DELTA")
+
+                # If we intended to SHORT ETF, hedge underlying proportionally to what actually filled
+                if delta_e < 0:
+                    intended = abs(int(delta_e))
+                    got = int(filled_e or 0)
+
+                    if got <= 0:
+                        st = (trade_e.orderStatus.status if trade_e else "NO_TRADE")
+                        print(f"[PAIR] Skipping underlying leg for {pair_id}: ETF short got 0/{intended} (status={st}).")
+                        filled_u, trade_u = 0, None
+                    else:
+                        fill_frac = got / float(intended)
+                        delta_u_eff = scaled_delta(delta_u, fill_frac)
+
+                        print(
+                            f"[PAIR] ETF short partial/filled: got {got}/{intended} ({fill_frac:.2%}). "
+                            f"Executing scaled underlying hedge delta_u_eff={delta_u_eff:+d} (from {delta_u:+d})."
+                        )
+                        filled_u, trade_u = exec_delta(u, delta_u_eff, px_u, "UNDER_DELTA")
+
+                else:
+                    # Not a short ETF (buy / cover / flat): proceed with full underlying delta
+                    filled_u, trade_u = exec_delta(u, delta_u, px_u, "UNDER_DELTA")
+
                 # Execute ETF delta first. If this is a SHORT leg and we cannot place/fill it cleanly,
                 # we skip the pair to avoid ending up long the underlying without the hedge.
                 filled_e, trade_e = exec_delta(e, delta_e, px_e, "ETF_DELTA")
