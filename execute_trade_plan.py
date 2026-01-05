@@ -565,6 +565,15 @@ def execute_leg(
                 else:
                     priority = "Urgent"
 
+            o = build_adaptive_market_order(
+                action=action,
+                qty=remain,
+                order_ref=f"{order_ref}|att{attempt}|ADAPTIVE_MKT",
+                priority=priority,
+            )
+            px_str = f"ADAPTIVE_MKT({priority})"
+
+
         elif order_style == "MKT":
             o = build_market_order(
                 action=action,
