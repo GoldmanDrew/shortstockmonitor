@@ -557,9 +557,9 @@ def execute_leg(
             if "|UNDER_DELTA" in order_ref:
                 priority = "Urgent"
             else:
-                # ETF: Passive -> Normal -> Urgent
+                # ETF: Patient -> Normal -> Urgent
                 if attempt == 1:
-                    priority = "Passive"
+                    priority = "Patient"
                 elif attempt == 2:
                     priority = "Normal"
                 else:
