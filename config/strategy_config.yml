@@ -6,7 +6,7 @@ ibkr:
 strategy:
   tag: ETF_LS
   capital_usd: 100000
-  gross_leverage: 1
+  gross_leverage: 2
   blacklist:
   - JPM
 paths:
