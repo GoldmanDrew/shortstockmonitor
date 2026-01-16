@@ -978,7 +978,11 @@ def main() -> None:
 
         prices: Dict[str, float] = {}
         for s in symbols:
-            prices[s] = get_snapshot_price(ib, s, prefer_delayed=prefer_delayed)
+            try:
+                prices[s] = get_snapshot_price(ib, s, prefer_delayed=prefer_delayed)
+            except RuntimeError as e:
+                print(f"[PRICE_SKIP] {s}: {e}")
+                continue
 
         # Save execution pricing snapshot
         px_df = pd.DataFrame([{"symbol": k, "price": v} for k, v in prices.items()]).sort_values("symbol")
