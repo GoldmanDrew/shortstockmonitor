@@ -1,11 +1,11 @@
 ibkr:
   host: 127.0.0.1
-  port: 7497
-  client_id: 31 #change to 41 for live
+  port: 7496
+  client_id: 41 #change to 41 for live
   prefer_delayed: true
 strategy:
   tag: ETF_LS
-  capital_usd: 175000
+  capital_usd: 200000
   gross_leverage: 4
   blacklist:
   - JPM
