@@ -193,8 +193,6 @@ def fetch_ibkr_short_availability_map(
         }
     return out
 
-
-
 # ---------------------------
 # Symbol normalization
 # ---------------------------
@@ -1050,26 +1048,94 @@ def main() -> None:
         # Cumulative desired targets (fixes repeated-underlying / repeated-ETF issues)
         desired_target_sh: Dict[str, int] = {}
 
-        # --- Leverage map (ETF -> leverage multiplier) ---
-        # Uses the plan's Leverage column (float). For inverse ETFs, Leverage should be negative.
         if "Leverage" not in plan.columns:
             raise ValueError("Plan missing required column: Leverage")
 
-        plan["ETF_U"] = plan["ETF"].astype(str).str.upper()
-        plan["UNDER_U"] = plan["Underlying"].astype(str).str.upper()
+        plan["ETF_U"] = plan["ETF"].astype(str).str.upper().str.strip()
+        plan["UNDER_U"] = plan["Underlying"].astype(str).str.upper().str.strip()
 
-        leverage_by_etf: Dict[str, float] = {}
-        for _, r in plan.iterrows():
-            etf = str(r["ETF_U"])
-            lev = float(r["Leverage"])
-            # last-write-wins is fine if consistent; otherwise you can assert equal
-            leverage_by_etf[etf] = lev
+        leverage_by_etf_plan: Dict[str, float] = {}
+        under_to_etfs_planned: Dict[str, Set[str]] = {}
 
-        under_to_etfs: Dict[str, Set[str]] = {}
         for _, r in plan.iterrows():
-            u = str(r["UNDER_U"])
             e = str(r["ETF_U"])
-            under_to_etfs.setdefault(u, set()).add(e)
+            u = str(r["UNDER_U"])
+            lev = float(r["Leverage"])
+
+            # Build planned under->etfs map
+            under_to_etfs_planned.setdefault(u, set()).add(e)
+
+            # Build planned leverage map (assert consistent if repeated)
+            if e in leverage_by_etf_plan and abs(leverage_by_etf_plan[e] - lev) > 1e-9:
+                raise ValueError(f"Leverage mismatch for {e} in plan: {leverage_by_etf_plan[e]} vs {lev}")
+            leverage_by_etf_plan[e] = lev
+
+
+        # ---------------------------
+        # Load SCREENED universe + build ALL under->etfs map and ALL leverage map (universe truth)
+        # ---------------------------
+        screened_csv = Path(paths_cfg.get("screened_csv", "data/etf_screened_today.csv"))
+        screened = pd.read_csv(screened_csv)
+
+        # Normalize
+        screened["Underlying"] = screened["Underlying"].astype(str).str.upper().str.strip()
+        screened["ETF"] = screened["ETF"].astype(str).str.upper().str.strip()
+
+        if "Leverage" not in screened.columns:
+            raise ValueError(
+                f"{screened_csv} missing required column: Leverage. "
+                "Add Leverage to screened output or provide an alternate leverage source."
+            )
+
+        # Some pipelines may name it differently; if so, adapt here:
+        # screened["Leverage"] = screened["Leverage"].astype(float)
+
+        under_to_etfs_all: Dict[str, Set[str]] = {}
+        leverage_by_etf_all: Dict[str, float] = {}
+
+        for _, r in screened.iterrows():
+            u = str(r["Underlying"])
+            e = str(r["ETF"])
+            lev = float(r["Leverage"])
+
+            under_to_etfs_all.setdefault(u, set()).add(e)
+            # last-write-wins is fine; if you want strict consistency, assert equal like above
+            leverage_by_etf_all[e] = lev
+
+        # ---------------------------
+        # Reconcile PLAN vs SCREENED (warn or fail fast)
+        # ---------------------------
+        # (1) ETFs in plan but not in screened
+        missing_in_screened = sorted([e for e in leverage_by_etf_plan.keys() if e not in leverage_by_etf_all])
+        if missing_in_screened:
+            raise ValueError(
+                "Plan contains ETFs not found in screened universe (cannot map ALL ETFs): "
+                f"{missing_in_screened}"
+            )
+
+        # (2) Leverage mismatches between sources
+        mismatch = []
+        for e, lev_plan in leverage_by_etf_plan.items():
+            lev_all = leverage_by_etf_all.get(e)
+            if lev_all is not None and abs(lev_plan - lev_all) > 1e-6:
+                mismatch.append((e, lev_plan, lev_all))
+
+        if mismatch:
+            # choose: raise or warn. I recommend raising because leverage errors are fatal.
+            msg = "; ".join([f"{e}: plan={lp}, screened={la}" for e, lp, la in mismatch[:20]])
+            raise ValueError(f"Leverage mismatch between plan and screened (showing up to 20): {msg}")
+
+
+        # ---------------------------
+        # Choose which mappings to use downstream
+        # ---------------------------
+        # Use these for completeness / hedging / exposure checks:
+        #   under_to_etfs_all
+        #   leverage_by_etf_all
+        #
+        # Use these for execution loop / sizing (only planned legs):
+        #   under_to_etfs_planned
+        #   leverage_by_etf_plan
 
 
         # Track expected underlying position per underlying group based on what the executor *intended*
@@ -1127,8 +1193,6 @@ def main() -> None:
             # Post-trade check (single-shot; we do not place additional hedge orders)
             resid_after = compute_bucket_resid_sh()
             print(f"[NETFLAT_CHECK] {u_sym}: resid_before={resid_before:+.2f}sh resid_after={resid_after:+.2f}sh")
-
-
 
 
         def exec_delta(symbol: str, delta: int, px: float, order_ref: str) -> Tuple[int, Optional[Trade]]:
