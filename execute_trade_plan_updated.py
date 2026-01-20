@@ -1101,45 +1101,8 @@ def main() -> None:
             under_to_etfs_all.setdefault(u, set()).add(e)
             # last-write-wins is fine; if you want strict consistency, assert equal like above
             leverage_by_etf_all[e] = lev
-
-        # ---------------------------
-        # Reconcile PLAN vs SCREENED (warn or fail fast)
-        # ---------------------------
-        # (1) ETFs in plan but not in screened
-        missing_in_screened = sorted([e for e in leverage_by_etf_plan.keys() if e not in leverage_by_etf_all])
-        if missing_in_screened:
-            raise ValueError(
-                "Plan contains ETFs not found in screened universe (cannot map ALL ETFs): "
-                f"{missing_in_screened}"
-            )
-
-        # (2) Leverage mismatches between sources
-        mismatch = []
-        for e, lev_plan in leverage_by_etf_plan.items():
-            lev_all = leverage_by_etf_all.get(e)
-            if lev_all is not None and abs(lev_plan - lev_all) > 1e-6:
-                mismatch.append((e, lev_plan, lev_all))
-
-        if mismatch:
-            # choose: raise or warn. I recommend raising because leverage errors are fatal.
-            msg = "; ".join([f"{e}: plan={lp}, screened={la}" for e, lp, la in mismatch[:20]])
-            raise ValueError(f"Leverage mismatch between plan and screened (showing up to 20): {msg}")
-
-
-        # ---------------------------
-        # Choose which mappings to use downstream
-        # ---------------------------
-        # Use these for completeness / hedging / exposure checks:
-        #   under_to_etfs_all
-        #   leverage_by_etf_all
-        #
-        # Use these for execution loop / sizing (only planned legs):
-        #   under_to_etfs_planned
-        #   leverage_by_etf_plan
-        under_to_etfs = under_to_etfs_planned
-        leverage_by_etf = leverage_by_etf_plan
-        under_to_etfs_universe = under_to_etfs_all
-        leverage_by_etf_universe = leverage_by_etf_all
+        under_to_etfs = under_to_etfs_all
+        leverage_by_etf = leverage_by_etf_all
 
         # Track expected underlying position per underlying group based on what the executor *intended*
         # to hedge (scaled by ETF fill fraction).
